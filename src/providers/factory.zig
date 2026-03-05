@@ -49,6 +49,12 @@ const CompatProvider = struct {
     /// When true, include `"thinking":{"type":"enabled"}` in request bodies
     /// when reasoning_effort is set. Required by Z.AI/GLM thinking models.
     thinking_param: bool = false,
+    /// When true, include `"enable_thinking":true` in request bodies
+    /// when reasoning_effort is set. Required by Qwen (DashScope compatible mode).
+    enable_thinking_param: bool = false,
+    /// When true, include `"reasoning_split":true` in request bodies
+    /// when reasoning_effort is set. Used by MiniMax to separate reasoning output.
+    reasoning_split_param: bool = false,
 };
 
 const compat_providers = [_]CompatProvider{
@@ -89,9 +95,9 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
     .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
     .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
-    .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
-    .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
+    .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
+    .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
     .{ .name = "qianfan", .url = "https://aip.baidubce.com", .display = "Qianfan" },
     .{ .name = "baidu", .url = "https://aip.baidubce.com", .display = "Qianfan" },
     .{ .name = "doubao", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
@@ -106,8 +112,8 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
     .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
     .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
-    .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
+    .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
+    .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
 
     // ── International variants ────────────────────────────────────────────
     .{ .name = "moonshot-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
@@ -118,13 +124,13 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
     .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
     .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
-    .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
-    .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
-    .{ .name = "qwen-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
-    .{ .name = "dashscope-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
-    .{ .name = "qwen-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
-    .{ .name = "dashscope-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
+    .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
+    .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
+    .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
+    .{ .name = "qwen-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
+    .{ .name = "dashscope-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
+    .{ .name = "qwen-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
+    .{ .name = "dashscope-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
     .{ .name = "byteplus", .url = "https://ark.ap-southeast.bytepluses.com/api/v3", .display = "BytePlus" },
 
     // ── Coding-specific endpoints ─────────────────────────────────────────
@@ -132,7 +138,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "kimi_coding", .url = "https://api.kimi.com/coding/v1", .display = "Kimi Code" },
     .{ .name = "volcengine-plan", .url = "https://ark.cn-beijing.volces.com/api/coding/v3", .display = "Doubao" },
     .{ .name = "byteplus-plan", .url = "https://ark.ap-southeast.bytepluses.com/api/coding/v3", .display = "BytePlus" },
-    .{ .name = "qwen-portal", .url = "https://portal.qwen.ai/v1", .display = "Qwen Portal" },
+    .{ .name = "qwen-portal", .url = "https://portal.qwen.ai/v1", .display = "Qwen Portal", .enable_thinking_param = true },
 
     // ── Infrastructure & Cloud ────────────────────────────────────────────
     .{ .name = "bedrock", .url = "https://bedrock-runtime.us-east-1.amazonaws.com", .display = "Amazon Bedrock" },
@@ -325,6 +331,8 @@ pub const ProviderHolder = union(enum) {
                     if (!c.native_tools) prov.native_tools = false;
                     if (c.max_tokens_non_streaming) |cap| prov.max_tokens_non_streaming = cap;
                     if (c.thinking_param) prov.thinking_param = true;
+                    if (c.enable_thinking_param) prov.enable_thinking_param = true;
+                    if (c.reasoning_split_param) prov.reasoning_split_param = true;
                 }
 
                 // Apply config-level native_tools override (can only force to false).
@@ -512,6 +520,11 @@ test "findCompatProvider returns correct flags" {
     const minimax = findCompatProvider("minimax").?;
     try std.testing.expect(minimax.no_responses_fallback);
     try std.testing.expect(minimax.merge_system_into_user);
+    try std.testing.expect(minimax.reasoning_split_param);
+
+    // Qwen requires enable_thinking in compatible mode.
+    const qwen = findCompatProvider("qwen").?;
+    try std.testing.expect(qwen.enable_thinking_param);
 
     // Groq has no special flags
     const groq_p = findCompatProvider("groq").?;
@@ -522,6 +535,7 @@ test "findCompatProvider returns correct flags" {
     const minimax_cn = findCompatProvider("minimax-cn").?;
     try std.testing.expect(minimax_cn.no_responses_fallback);
     try std.testing.expect(minimax_cn.merge_system_into_user);
+    try std.testing.expect(minimax_cn.reasoning_split_param);
 
     // Fireworks has non-streaming max_tokens cap.
     const fireworks = findCompatProvider("fireworks").?;
@@ -550,6 +564,22 @@ test "fromConfig thinking_param false for non-GLM providers" {
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(!h.compatible.thinking_param);
+}
+
+test "fromConfig applies enable_thinking_param for Qwen" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "qwen", "key", null, true, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expect(h.compatible.enable_thinking_param);
+}
+
+test "fromConfig applies reasoning_split_param for MiniMax" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expect(h.compatible.reasoning_split_param);
 }
 
 test "fromConfig applies merge_system_into_user flag" {
