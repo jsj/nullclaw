@@ -29,6 +29,7 @@ const security = @import("security/policy.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
+const dispatch = @import("channels/dispatch.zig");
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -1665,6 +1666,7 @@ const WebhookHandlerContext = struct {
     config_opt: ?*const Config,
     state: *GatewayState,
     session_mgr_opt: ?*session_mod.SessionManager,
+    channel_registry_opt: ?*dispatch.ChannelRegistry = null,
     response_status: []const u8 = "200 OK",
     response_body: []const u8 = "",
 };
@@ -1690,6 +1692,97 @@ fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
         if (std.mem.eql(u8, desc.path, path)) return desc;
     }
     return null;
+}
+
+fn resolveWebChannel(ctx: *WebhookHandlerContext, body: []const u8) ?*channels.web.WebChannel {
+    const registry = ctx.channel_registry_opt orelse return null;
+    const account_id = jsonStringField(body, "agent_id") orelse "default";
+    const channel = registry.findByNameAccount("web", account_id) orelse registry.findByName("web") orelse return null;
+    return @ptrCast(@alignCast(channel.ptr));
+}
+
+fn handleWebChannelHttpRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_web) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"web channel disabled in this build\"}";
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing request body\"}";
+        return;
+    };
+
+    const web_channel = resolveWebChannel(ctx, body) orelse {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"web channel not configured\"}";
+        return;
+    };
+
+    var inbound = web_channel.handleHttpInbound(ctx.req_allocator, body) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"web channel request handling failed\"}";
+        return;
+    };
+    defer inbound.deinit(ctx.req_allocator);
+
+    switch (inbound) {
+        .pairing_response => |response| {
+            ctx.response_body = response;
+        },
+        .error_response => |response| {
+            ctx.response_body = response;
+        },
+        .user_message => |message| {
+            const sm = ctx.session_mgr_opt orelse {
+                ctx.response_status = "503 Service Unavailable";
+                ctx.response_body = web_channel.buildHttpAgentErrorEvent(
+                    ctx.req_allocator,
+                    message.session_id,
+                    message.request_id,
+                    "web channel requires a local session manager",
+                ) catch "{\"error\":\"web channel requires a local session manager\"}";
+                return;
+            };
+
+            const reply = sm.processMessage(message.session_key, message.content, null) catch |err| {
+                ctx.response_body = web_channel.buildHttpAgentErrorEvent(
+                    ctx.req_allocator,
+                    message.session_id,
+                    message.request_id,
+                    userFacingAgentError(err),
+                ) catch "{\"error\":\"agent processing failed\"}";
+                return;
+            };
+            if (reply) |response_text| {
+                defer ctx.root_allocator.free(response_text);
+                ctx.response_body = web_channel.buildHttpAssistantEvent(
+                    ctx.req_allocator,
+                    message.session_id,
+                    message.request_id,
+                    response_text,
+                ) catch {
+                    ctx.response_status = "500 Internal Server Error";
+                    ctx.response_body = "{\"error\":\"failed to encode web channel response\"}";
+                    return;
+                };
+            } else {
+                ctx.response_body = web_channel.buildHttpAgentErrorEvent(
+                    ctx.req_allocator,
+                    message.session_id,
+                    message.request_id,
+                    "model returned empty response",
+                ) catch "{\"error\":\"model returned empty response\"}";
+            }
+        },
+    }
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -2524,9 +2617,16 @@ fn applyRuntimeProviderOverrides(config: *const Config) !void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, POST /webchannel, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
 /// If config_ptr is null, loads config internally (for backward compatibility).
-pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
+pub fn run(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    config_ptr: ?*const Config,
+    event_bus: ?*bus_mod.Bus,
+    channel_registry_opt: ?*dispatch.ChannelRegistry,
+) !void {
     health.markComponentOk("gateway");
 
     var state = GatewayState.init(allocator);
@@ -2747,11 +2847,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const target = parts.next() orelse continue;
 
         // Simple routing — control endpoints + descriptor-driven channel webhooks.
-        const ControlRoute = enum { health, ready, webhook, pair };
+        const ControlRoute = enum { health, ready, webhook, webchannel, pair };
         const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
             .{ "/webhook", .webhook },
+            .{ "/webchannel", .webchannel },
             .{ "/pair", .pair },
         });
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
@@ -2770,6 +2871,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .config_opt = config_opt,
                 .state = &state,
                 .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+                .channel_registry_opt = channel_registry_opt,
             };
             desc.handler(&webhook_ctx);
             response_status = webhook_ctx.response_status;
@@ -2784,6 +2886,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .config_opt = config_opt,
                 .state = &state,
                 .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+                .channel_registry_opt = channel_registry_opt,
             };
             handleSlackWebhookRoute(&webhook_ctx);
             response_status = webhook_ctx.response_status;
@@ -2855,6 +2958,22 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         }
                     }
                 }
+            },
+            .webchannel => {
+                var webhook_ctx = WebhookHandlerContext{
+                    .root_allocator = allocator,
+                    .req_allocator = req_allocator,
+                    .raw_request = raw,
+                    .method = method_str,
+                    .target = target,
+                    .config_opt = config_opt,
+                    .state = &state,
+                    .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+                    .channel_registry_opt = channel_registry_opt,
+                };
+                handleWebChannelHttpRoute(&webhook_ctx);
+                response_status = webhook_ctx.response_status;
+                response_body = webhook_ctx.response_body;
             },
             .pair => {
                 if (!is_post) {

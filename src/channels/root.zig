@@ -154,6 +154,16 @@ pub const web = if (@import("build_options").enable_channel_web)
 else
     struct {
         pub const WebChannel = struct {
+            pub const HttpUserMessage = struct {
+                pub fn deinit(_: *@This(), _: @import("std").mem.Allocator) void {}
+            };
+            pub const HttpInboundResult = union(enum) {
+                pairing_response: []u8,
+                error_response: []u8,
+                user_message: HttpUserMessage,
+
+                pub fn deinit(_: *@This(), _: @import("std").mem.Allocator) void {}
+            };
             pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
                 return .{};
             }
@@ -161,6 +171,15 @@ else
                 unreachable;
             }
             pub fn setBus(_: *@This(), _: anytype) void {}
+            pub fn handleHttpInbound(_: *@This(), _: @import("std").mem.Allocator, _: []const u8) !HttpInboundResult {
+                return error.ChannelDisabled;
+            }
+            pub fn buildHttpAssistantEvent(_: *@This(), _: @import("std").mem.Allocator, _: []const u8, _: ?[]const u8, _: []const u8) ![]u8 {
+                return error.ChannelDisabled;
+            }
+            pub fn buildHttpAgentErrorEvent(_: *@This(), _: @import("std").mem.Allocator, _: []const u8, _: ?[]const u8, _: []const u8) ![]u8 {
+                return error.ChannelDisabled;
+            }
         };
     };
 pub const dispatch = @import("dispatch.zig");

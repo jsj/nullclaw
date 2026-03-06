@@ -14,6 +14,7 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 /// synchronously or via thread spawning.
 pub const ChannelRegistry = struct {
     allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
     channels: std.ArrayListUnmanaged(ChannelEntry),
 
     const ChannelEntry = struct {
@@ -29,14 +30,20 @@ pub const ChannelRegistry = struct {
     }
 
     pub fn deinit(self: *ChannelRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.channels.deinit(self.allocator);
     }
 
     pub fn register(self: *ChannelRegistry, ch: root.Channel) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.channels.append(self.allocator, .{ .channel = ch });
     }
 
     pub fn registerWithAccount(self: *ChannelRegistry, ch: root.Channel, account_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.channels.append(self.allocator, .{
             .channel = ch,
             .account_id = account_id,
@@ -44,11 +51,15 @@ pub const ChannelRegistry = struct {
     }
 
     pub fn count(self: *const ChannelRegistry) usize {
+        @constCast(&self.mutex).lock();
+        defer @constCast(&self.mutex).unlock();
         return self.channels.items.len;
     }
 
     /// Find a channel by name.
     pub fn findByName(self: *const ChannelRegistry, channel_name: []const u8) ?root.Channel {
+        @constCast(&self.mutex).lock();
+        defer @constCast(&self.mutex).unlock();
         for (self.channels.items) |entry| {
             if (std.mem.eql(u8, entry.channel.name(), channel_name)) return entry.channel;
         }
@@ -56,6 +67,8 @@ pub const ChannelRegistry = struct {
     }
 
     pub fn findByNameAccount(self: *const ChannelRegistry, channel_name: []const u8, account_id: []const u8) ?root.Channel {
+        @constCast(&self.mutex).lock();
+        defer @constCast(&self.mutex).unlock();
         for (self.channels.items) |entry| {
             if (std.mem.eql(u8, entry.channel.name(), channel_name) and
                 std.mem.eql(u8, entry.account_id, account_id))
@@ -68,6 +81,8 @@ pub const ChannelRegistry = struct {
 
     /// Start all registered channels.
     pub fn startAll(self: *ChannelRegistry) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.channels.items) |entry| {
             try entry.channel.start();
         }
@@ -75,6 +90,8 @@ pub const ChannelRegistry = struct {
 
     /// Stop all registered channels.
     pub fn stopAll(self: *ChannelRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.channels.items) |entry| {
             entry.channel.stop();
         }
@@ -82,6 +99,8 @@ pub const ChannelRegistry = struct {
 
     /// Run health checks on all channels.
     pub fn healthCheckAll(self: *const ChannelRegistry) HealthReport {
+        @constCast(&self.mutex).lock();
+        defer @constCast(&self.mutex).unlock();
         var healthy: usize = 0;
         var unhealthy: usize = 0;
         for (self.channels.items) |entry| {
@@ -96,6 +115,8 @@ pub const ChannelRegistry = struct {
 
     /// Get names of all registered channels.
     pub fn channelNames(self: *const ChannelRegistry, allocator: std.mem.Allocator) ![][]const u8 {
+        @constCast(&self.mutex).lock();
+        defer @constCast(&self.mutex).unlock();
         var names: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer names.deinit(allocator);
         for (self.channels.items) |entry| {

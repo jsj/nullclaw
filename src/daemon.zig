@@ -143,9 +143,17 @@ pub fn isShutdownRequested() bool {
 }
 
 /// Gateway thread entry point.
-fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+fn gatewayThread(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    host: []const u8,
+    port: u16,
+    state: *DaemonState,
+    event_bus: ?*bus_mod.Bus,
+    channel_registry: ?*dispatch.ChannelRegistry,
+) void {
     const gateway = @import("gateway.zig");
-    gateway.run(allocator, host, port, config, event_bus) catch |err| {
+    gateway.run(allocator, host, port, config, event_bus, channel_registry) catch |err| {
         state.markError("gateway", @errorName(err));
         health.markComponentError("gateway", @errorName(err));
         return;
@@ -839,10 +847,27 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Event bus (created before gateway+scheduler so all threads can publish)
     var event_bus = bus_mod.Bus.init();
+    const gateway_event_bus: ?*bus_mod.Bus = if (has_supervised_channels or has_runtime_dependent_channels)
+        &event_bus
+    else
+        null;
+
+    // Outbound dispatcher registry is shared with the gateway for optional
+    // channel-specific HTTP adapters such as the web channel transport.
+    var channel_registry = dispatch.ChannelRegistry.init(allocator);
+    defer channel_registry.deinit();
 
     // Spawn gateway thread
     state.markRunning("gateway");
-    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, config, host, port, &state, &event_bus }) catch |err| {
+    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{
+        allocator,
+        config,
+        host,
+        port,
+        &state,
+        gateway_event_bus,
+        &channel_registry,
+    }) catch |err| {
         state.markError("gateway", @errorName(err));
         try stdout.print("Failed to spawn gateway: {}\n", .{err});
         return err;
@@ -871,10 +896,6 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
             stdout.print("Warning: scheduler thread failed: {}\n", .{err}) catch {};
         }
     }
-
-    // Outbound dispatcher (created before supervisor so channels can register)
-    var channel_registry = dispatch.ChannelRegistry.init(allocator);
-    defer channel_registry.deinit();
 
     // Channel runtime for supervised polling (provider, tools, sessions)
     var channel_rt: ?*channel_loop.ChannelRuntime = null;

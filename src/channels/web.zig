@@ -112,6 +112,36 @@ pub const WebChannel = struct {
 
     const WsServer = websocket.Server(WsHandler);
 
+    pub const HttpUserMessage = struct {
+        session_id: []u8,
+        request_id: ?[]u8,
+        sender_id: []u8,
+        content: []u8,
+        session_key: []u8,
+
+        pub fn deinit(self: *HttpUserMessage, allocator: std.mem.Allocator) void {
+            allocator.free(self.session_id);
+            if (self.request_id) |rid| allocator.free(rid);
+            allocator.free(self.sender_id);
+            allocator.free(self.content);
+            allocator.free(self.session_key);
+        }
+    };
+
+    pub const HttpInboundResult = union(enum) {
+        pairing_response: []u8,
+        error_response: []u8,
+        user_message: HttpUserMessage,
+
+        pub fn deinit(self: *HttpInboundResult, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .pairing_response => |value| allocator.free(value),
+                .error_response => |value| allocator.free(value),
+                .user_message => |*value| value.deinit(allocator),
+            }
+        }
+    };
+
     const vtable = root.Channel.VTable{
         .start = wsStart,
         .stop = wsStop,
@@ -165,6 +195,210 @@ pub const WebChannel = struct {
 
     pub fn setBus(self: *WebChannel, b: *bus_mod.Bus) void {
         self.bus = b;
+    }
+
+    pub fn sessionKeyForSession(self: *const WebChannel, allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "web:{s}:direct:{s}", .{ self.account_id, session_id });
+    }
+
+    pub fn handleHttpInbound(self: *WebChannel, allocator: std.mem.Allocator, data: []const u8) !HttpInboundResult {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch {
+            return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, "default", null, "invalid_json", "request body must be valid JSON") };
+        };
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, "default", null, "invalid_payload", "request body must be a JSON object") },
+        };
+
+        const event_type = blk: {
+            if (obj.get("type")) |type_val| {
+                if (type_val != .string or type_val.string.len == 0) {
+                    return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, "default", null, "invalid_payload", "type must be a non-empty string") };
+                }
+                break :blk type_val.string;
+            }
+            break :blk "user_message";
+        };
+
+        var payload_obj: ?std.json.ObjectMap = null;
+        if (obj.get("payload")) |payload_val| {
+            if (payload_val == .object) payload_obj = payload_val.object;
+        }
+        const request_id = requestIdFromEvent(obj);
+        const session_id = eventStringField(obj, "session_id") orelse "default";
+
+        if (std.mem.eql(u8, event_type, "pairing_request")) {
+            if (self.message_auth_mode == .token and self.transport == .local) {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_disabled", "pairing_request is disabled when message_auth_mode=token") };
+            }
+            return .{ .pairing_response = try self.buildPairingResultEventAlloc(allocator, session_id, request_id, payload_obj) };
+        }
+
+        if (!std.mem.eql(u8, event_type, "user_message")) {
+            return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "unsupported_event", "type must be pairing_request or user_message") };
+        }
+
+        const access_token = payloadStringField(payload_obj, "access_token") orelse eventStringField(obj, "access_token");
+        const auth_token = payloadStringField(payload_obj, "auth_token") orelse eventStringField(obj, "auth_token");
+
+        var verified_opt: ?VerifiedJwt = null;
+        defer if (verified_opt) |*verified| verified.deinit(allocator);
+
+        switch (self.message_auth_mode) {
+            .pairing => {
+                const ui_access_token = access_token orelse {
+                    return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "unauthorized", "access_token is required") };
+                };
+                verified_opt = self.verifyUiAccessToken(ui_access_token) orelse {
+                    return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "unauthorized", "access_token is invalid or expired") };
+                };
+
+                self.upsertSessionBinding(session_id, verified_opt.?.sub) catch {
+                    return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "internal_error", "failed to bind session to UI client") };
+                };
+            },
+            .token => {
+                const inbound_token = auth_token orelse access_token orelse {
+                    return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "unauthorized", "auth_token is required") };
+                };
+                if (!self.validateToken(inbound_token)) {
+                    return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "unauthorized", "auth_token is invalid") };
+                }
+            },
+            .invalid => {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "invalid_configuration", "message_auth_mode is invalid") };
+            },
+        }
+
+        const e2e_obj = blk: {
+            if (payload_obj) |p| {
+                if (p.get("e2e")) |value| {
+                    if (value == .object) break :blk value.object;
+                }
+            }
+            break :blk null;
+        };
+
+        var sender_id: []const u8 = "web-user";
+        var content: []const u8 = undefined;
+
+        if (e2e_obj) |encrypted_obj| {
+            if (eventStringField(encrypted_obj, "alg")) |alg| {
+                if (!std.mem.eql(u8, alg, E2E_ALG)) {
+                    return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "unsupported_e2e_alg", "payload.e2e.alg is not supported") };
+                }
+            }
+            const verified = verified_opt orelse {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "e2e_requires_pairing", "payload.e2e requires pairing access_token auth") };
+            };
+            const e2e_session = self.e2eSessionByClient(verified.sub) orelse {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "e2e_not_initialized", "no e2e session is bound to this UI token") };
+            };
+            const nonce_b64 = eventStringField(encrypted_obj, "nonce") orelse {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "invalid_e2e_payload", "payload.e2e.nonce is required") };
+            };
+            const ciphertext_b64 = eventStringField(encrypted_obj, "ciphertext") orelse {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "invalid_e2e_payload", "payload.e2e.ciphertext is required") };
+            };
+            const decrypted_payload = self.decryptE2ePayload(e2e_session.key, nonce_b64, ciphertext_b64) catch {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "e2e_decrypt_failed", "failed to decrypt payload") };
+            };
+            defer allocator.free(decrypted_payload);
+
+            const decrypted_json = std.json.parseFromSlice(std.json.Value, allocator, decrypted_payload, .{}) catch {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "invalid_e2e_payload", "decrypted payload must be valid JSON") };
+            };
+            defer decrypted_json.deinit();
+            const decrypted_obj = switch (decrypted_json.value) {
+                .object => |map| map,
+                else => return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "invalid_e2e_payload", "decrypted payload must be an object") },
+            };
+            content = eventStringField(decrypted_obj, "content") orelse {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "invalid_e2e_payload", "decrypted payload.content is required") };
+            };
+            sender_id = eventStringField(decrypted_obj, "sender_id") orelse "web-user";
+        } else {
+            if (self.relay_e2e_required) {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "e2e_required", "web channel requires encrypted payloads") };
+            }
+            content = payloadStringField(payload_obj, "content") orelse
+                eventStringField(obj, "content") orelse {
+                return .{ .error_response = try self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "invalid_payload", "content is required") };
+            };
+            sender_id = payloadStringField(payload_obj, "sender_id") orelse eventStringField(obj, "sender_id") orelse "web-user";
+        }
+
+        return .{
+            .user_message = .{
+                .session_id = try allocator.dupe(u8, session_id),
+                .request_id = if (request_id) |rid| try allocator.dupe(u8, rid) else null,
+                .sender_id = try allocator.dupe(u8, sender_id),
+                .content = try allocator.dupe(u8, content),
+                .session_key = try self.sessionKeyForSession(allocator, session_id),
+            },
+        };
+    }
+
+    pub fn buildHttpAssistantEvent(
+        self: *WebChannel,
+        allocator: std.mem.Allocator,
+        session_id: []const u8,
+        request_id: ?[]const u8,
+        message: []const u8,
+    ) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+
+        try w.writeAll("{\"v\":1,\"type\":\"assistant_final\",\"session_id\":");
+        try root.appendJsonStringW(w, session_id);
+        try w.writeAll(",\"agent_id\":");
+        try root.appendJsonStringW(w, self.account_id);
+        if (request_id) |rid| {
+            try w.writeAll(",\"request_id\":");
+            try root.appendJsonStringW(w, rid);
+        }
+        try w.writeAll(",\"payload\":");
+
+        if (self.e2eSessionByChat(session_id)) |session| {
+            var plain_payload: std.ArrayListUnmanaged(u8) = .empty;
+            defer plain_payload.deinit(allocator);
+            const pw = plain_payload.writer(allocator);
+            try pw.writeAll("{\"content\":");
+            try root.appendJsonStringW(pw, message);
+            try pw.writeByte('}');
+
+            const encrypted = try self.encryptE2ePayload(session.key, plain_payload.items);
+            defer allocator.free(encrypted.nonce_b64);
+            defer allocator.free(encrypted.ciphertext_b64);
+
+            try w.writeAll("{\"e2e\":{\"alg\":");
+            try root.appendJsonStringW(w, E2E_ALG);
+            try w.writeAll(",\"nonce\":");
+            try root.appendJsonStringW(w, encrypted.nonce_b64);
+            try w.writeAll(",\"ciphertext\":");
+            try root.appendJsonStringW(w, encrypted.ciphertext_b64);
+            try w.writeAll("}}");
+        } else {
+            try w.writeAll("{\"content\":");
+            try root.appendJsonStringW(w, message);
+            try w.writeByte('}');
+        }
+
+        try w.writeByte('}');
+        return buf.toOwnedSlice(allocator);
+    }
+
+    pub fn buildHttpAgentErrorEvent(
+        self: *WebChannel,
+        allocator: std.mem.Allocator,
+        session_id: []const u8,
+        request_id: ?[]const u8,
+        message: []const u8,
+    ) ![]u8 {
+        return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "agent_error", message);
     }
 
     fn setActiveToken(self: *WebChannel, raw: []const u8) !void {
@@ -782,23 +1016,175 @@ pub const WebChannel = struct {
     }
 
     fn sendRelayError(self: *WebChannel, session_id: []const u8, request_id: ?[]const u8, code: []const u8, message: []const u8) void {
+        const encoded = self.buildRelayErrorEventAlloc(self.allocator, session_id, request_id, code, message) catch return;
+        defer self.allocator.free(encoded);
+        self.sendOutboundEvent(session_id, encoded);
+    }
+
+    fn buildRelayErrorEventAlloc(
+        self: *WebChannel,
+        allocator: std.mem.Allocator,
+        session_id: []const u8,
+        request_id: ?[]const u8,
+        code: []const u8,
+        message: []const u8,
+    ) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
-        w.writeAll("{\"v\":1,\"type\":\"error\",\"session_id\":") catch return;
-        root.appendJsonStringW(w, session_id) catch return;
-        w.writeAll(",\"agent_id\":") catch return;
-        root.appendJsonStringW(w, self.account_id) catch return;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+        try w.writeAll("{\"v\":1,\"type\":\"error\",\"session_id\":");
+        try root.appendJsonStringW(w, session_id);
+        try w.writeAll(",\"agent_id\":");
+        try root.appendJsonStringW(w, self.account_id);
         if (request_id) |rid| {
-            w.writeAll(",\"request_id\":") catch return;
-            root.appendJsonStringW(w, rid) catch return;
+            try w.writeAll(",\"request_id\":");
+            try root.appendJsonStringW(w, rid);
         }
-        w.writeAll(",\"payload\":{\"code\":") catch return;
-        root.appendJsonStringW(w, code) catch return;
-        w.writeAll(",\"message\":") catch return;
-        root.appendJsonStringW(w, message) catch return;
-        w.writeAll("}}") catch return;
-        self.sendOutboundEvent(session_id, buf.items);
+        try w.writeAll(",\"payload\":{\"code\":");
+        try root.appendJsonStringW(w, code);
+        try w.writeAll(",\"message\":");
+        try root.appendJsonStringW(w, message);
+        try w.writeAll("}}");
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn buildPairingResultEventAlloc(
+        self: *WebChannel,
+        allocator: std.mem.Allocator,
+        session_id: []const u8,
+        request_id: ?[]const u8,
+        payload_obj: ?std.json.ObjectMap,
+    ) ![]u8 {
+        const PairingAttempt = union(enum) {
+            paired: []const u8,
+            failed: struct {
+                code: []const u8,
+                message: []const u8,
+            },
+        };
+
+        const pairing_code = payloadStringField(payload_obj, "pairing_code");
+        const pair_attempt = blk: {
+            self.relay_security_mu.lock();
+            defer self.relay_security_mu.unlock();
+
+            if (self.relay_pairing_guard == null) {
+                break :blk PairingAttempt{
+                    .failed = .{
+                        .code = "pairing_unavailable",
+                        .message = "pairing flow is not initialized",
+                    },
+                };
+            }
+            if (self.relayPairingCodeExpiredLocked()) {
+                self.rotateRelayPairingCodeLocked("expired");
+                break :blk PairingAttempt{
+                    .failed = .{
+                        .code = "pairing_code_expired",
+                        .message = "pairing code expired; a new code was issued",
+                    },
+                };
+            }
+
+            if (self.relay_pairing_guard) |*guard| {
+                const attempt = guard.attemptPair(pairing_code);
+                switch (attempt) {
+                    .paired => |token| {
+                        self.rotateRelayPairingCodeLocked("consumed");
+                        break :blk PairingAttempt{ .paired = token };
+                    },
+                    .missing_code => break :blk PairingAttempt{ .failed = .{ .code = "pairing_missing_code", .message = "pairing_code is required" } },
+                    .invalid_code => break :blk PairingAttempt{ .failed = .{ .code = "pairing_invalid_code", .message = "pairing code is invalid" } },
+                    .already_paired => break :blk PairingAttempt{ .failed = .{ .code = "pairing_already_used", .message = "pairing code already consumed" } },
+                    .disabled => break :blk PairingAttempt{ .failed = .{ .code = "pairing_disabled", .message = "pairing is disabled" } },
+                    .locked_out => break :blk PairingAttempt{ .failed = .{ .code = "pairing_locked_out", .message = "too many failed pairing attempts; retry later" } },
+                    .internal_error => break :blk PairingAttempt{ .failed = .{ .code = "pairing_internal_error", .message = "pairing failed" } },
+                }
+            }
+
+            break :blk PairingAttempt{ .failed = .{ .code = "pairing_internal_error", .message = "pairing flow is not initialized" } };
+        };
+
+        const pair_token = switch (pair_attempt) {
+            .paired => |token| token,
+            .failed => |failure| return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, failure.code, failure.message),
+        };
+        defer self.allocator.free(pair_token);
+
+        const client_sub = self.deriveClientSubjectFromPairToken(pair_token) catch {
+            return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_internal_error", "failed to derive client identity");
+        };
+        defer self.allocator.free(client_sub);
+
+        var agent_public_b64: ?[]u8 = null;
+        defer if (agent_public_b64) |value| self.allocator.free(value);
+
+        if (payloadStringField(payload_obj, "client_pub")) |client_pub| {
+            const derived = self.deriveE2eSession(client_pub) catch {
+                return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_invalid_client_pub", "client_pub must be base64url X25519 public key");
+            };
+            self.upsertE2eSession(client_sub, derived.session) catch {
+                self.allocator.free(derived.agent_public_b64);
+                return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_internal_error", "failed to persist e2e session");
+            };
+            agent_public_b64 = derived.agent_public_b64;
+        } else if (payloadStringField(payload_obj, "client_public_key")) |client_pub| {
+            const derived = self.deriveE2eSession(client_pub) catch {
+                return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_invalid_client_pub", "client_public_key must be base64url X25519 public key");
+            };
+            self.upsertE2eSession(client_sub, derived.session) catch {
+                self.allocator.free(derived.agent_public_b64);
+                return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_internal_error", "failed to persist e2e session");
+            };
+            agent_public_b64 = derived.agent_public_b64;
+        } else if (self.relay_e2e_required) {
+            return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_e2e_required", "client_pub is required because relay_e2e_required=true");
+        }
+
+        const access_token = self.issueUiAccessToken(client_sub) catch {
+            return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_internal_error", "failed to issue UI access token");
+        };
+        defer self.allocator.free(access_token);
+
+        const cookie = std.fmt.allocPrint(
+            allocator,
+            "nullclaw_ui_token={s}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={d}",
+            .{ access_token, self.relay_ui_token_ttl_secs },
+        ) catch {
+            return self.buildRelayErrorEventAlloc(allocator, session_id, request_id, "pairing_internal_error", "failed to build UI cookie");
+        };
+        defer allocator.free(cookie);
+
+        var response: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer response.deinit(allocator);
+        const w = response.writer(allocator);
+        try w.writeAll("{\"v\":1,\"type\":\"pairing_result\",\"session_id\":");
+        try root.appendJsonStringW(w, session_id);
+        try w.writeAll(",\"agent_id\":");
+        try root.appendJsonStringW(w, self.account_id);
+        if (request_id) |rid| {
+            try w.writeAll(",\"request_id\":");
+            try root.appendJsonStringW(w, rid);
+        }
+        try w.writeAll(",\"payload\":{\"ok\":true,\"client_id\":");
+        try root.appendJsonStringW(w, client_sub);
+        try w.writeAll(",\"access_token\":");
+        try root.appendJsonStringW(w, access_token);
+        try w.writeAll(",\"token_type\":\"Bearer\",\"expires_in\":");
+        try w.print("{d}", .{self.relay_ui_token_ttl_secs});
+        try w.writeAll(",\"set_cookie\":");
+        try root.appendJsonStringW(w, cookie);
+        try w.writeAll(",\"e2e_required\":");
+        try w.writeAll(if (self.relay_e2e_required) "true" else "false");
+        if (agent_public_b64) |agent_pub| {
+            try w.writeAll(",\"e2e\":{\"alg\":");
+            try root.appendJsonStringW(w, E2E_ALG);
+            try w.writeAll(",\"agent_pub\":");
+            try root.appendJsonStringW(w, agent_pub);
+            try w.writeByte('}');
+        }
+        try w.writeAll("}}");
+        return response.toOwnedSlice(allocator);
     }
 
     fn handleRelayPairingRequest(self: *WebChannel, session_id: []const u8, request_id: ?[]const u8, payload_obj: ?std.json.ObjectMap) void {
@@ -2338,6 +2724,142 @@ test "WebChannel relay encrypted user_message is published to bus" {
     try std.testing.expectEqualStrings("ui-42", msg.sender_id);
     try std.testing.expectEqualStrings("sess-e2e", msg.chat_id);
     try std.testing.expectEqualStrings("secret hello", msg.content);
+}
+
+test "WebChannel handleHttpInbound pairing_request returns pairing_result" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .account_id = "relay-main",
+    });
+    defer ch.deinitRelaySecurityState();
+    try ch.initRelaySecurityState();
+
+    const client_kp = std.crypto.dh.X25519.KeyPair.generate();
+    const client_pub = try ch.base64UrlEncodeAlloc(&client_kp.public_key);
+    defer std.testing.allocator.free(client_pub);
+
+    var event_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer event_buf.deinit(std.testing.allocator);
+    const w = event_buf.writer(std.testing.allocator);
+    try w.writeAll("{\"v\":1,\"type\":\"pairing_request\",\"session_id\":\"sess-http\",\"request_id\":\"req-1\",\"payload\":{\"pairing_code\":\"");
+    try w.writeAll(ch.relay_pairing_guard.?.pairingCode().?);
+    try w.writeAll("\",\"client_pub\":");
+    try root.appendJsonStringW(w, client_pub);
+    try w.writeAll("}}");
+
+    var result = try ch.handleHttpInbound(std.testing.allocator, event_buf.items);
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .pairing_response => |response| {
+            try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"pairing_result\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, response, "\"request_id\":\"req-1\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, response, "\"agent_pub\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "WebChannel handleHttpInbound accepts plaintext user_message when e2e is optional" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .account_id = "local-main",
+        .message_auth_mode = "token",
+        .auth_token = "token-mode-1234567890",
+    });
+    try ch.setActiveToken("token-mode-1234567890");
+
+    var result = try ch.handleHttpInbound(
+        std.testing.allocator,
+        "{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-plain\",\"payload\":{\"auth_token\":\"token-mode-1234567890\",\"content\":\"hello plain\",\"sender_id\":\"ui-local\"}}",
+    );
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .user_message => |message| {
+            try std.testing.expectEqualStrings("sess-plain", message.session_id);
+            try std.testing.expectEqualStrings("ui-local", message.sender_id);
+            try std.testing.expectEqualStrings("hello plain", message.content);
+            try std.testing.expectEqualStrings("web:local-main:direct:sess-plain", message.session_key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "WebChannel handleHttpInbound decrypts encrypted relay user_message" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .account_id = "relay-main",
+        .relay_e2e_required = true,
+    });
+    defer ch.deinitRelaySecurityState();
+    try ch.initRelaySecurityState();
+
+    const key = [_]u8{0x44} ** 32;
+    try ch.upsertE2eSession("ui-42", .{ .key = key });
+
+    const access_token = try ch.issueUiAccessToken("ui-42");
+    defer std.testing.allocator.free(access_token);
+
+    const plaintext_payload = "{\"content\":\"secret hello\",\"sender_id\":\"ui-42\"}";
+    const encrypted = try ch.encryptE2ePayload(key, plaintext_payload);
+    defer std.testing.allocator.free(encrypted.nonce_b64);
+    defer std.testing.allocator.free(encrypted.ciphertext_b64);
+
+    var event_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer event_buf.deinit(std.testing.allocator);
+    const w = event_buf.writer(std.testing.allocator);
+    try w.writeAll("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-e2e\",\"payload\":{\"access_token\":");
+    try root.appendJsonStringW(w, access_token);
+    try w.writeAll(",\"e2e\":{\"nonce\":");
+    try root.appendJsonStringW(w, encrypted.nonce_b64);
+    try w.writeAll(",\"ciphertext\":");
+    try root.appendJsonStringW(w, encrypted.ciphertext_b64);
+    try w.writeAll("}}}");
+
+    var result = try ch.handleHttpInbound(std.testing.allocator, event_buf.items);
+    defer result.deinit(std.testing.allocator);
+
+    switch (result) {
+        .user_message => |message| {
+            try std.testing.expectEqualStrings("sess-e2e", message.session_id);
+            try std.testing.expectEqualStrings("ui-42", message.sender_id);
+            try std.testing.expectEqualStrings("secret hello", message.content);
+            try std.testing.expectEqualStrings("web:relay-main:direct:sess-e2e", message.session_key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "WebChannel buildHttpAssistantEvent encrypts response when session is paired" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .account_id = "relay-main",
+        .relay_e2e_required = true,
+    });
+    defer ch.deinitRelaySecurityState();
+    try ch.initRelaySecurityState();
+
+    const key = [_]u8{0x55} ** 32;
+    try ch.upsertE2eSession("ui-99", .{ .key = key });
+    try ch.upsertSessionBinding("sess-http", "ui-99");
+
+    const response = try ch.buildHttpAssistantEvent(std.testing.allocator, "sess-http", "req-http", "secret reply");
+    defer std.testing.allocator.free(response);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("assistant_final", root_obj.get("type").?.string);
+    const payload = root_obj.get("payload").?.object;
+    try std.testing.expect(payload.get("content") == null);
+
+    const e2e = payload.get("e2e").?.object;
+    const nonce = e2e.get("nonce").?.string;
+    const ciphertext = e2e.get("ciphertext").?.string;
+    const decrypted = try ch.decryptE2ePayload(key, nonce, ciphertext);
+    defer std.testing.allocator.free(decrypted);
+    try std.testing.expect(std.mem.indexOf(u8, decrypted, "\"content\":\"secret reply\"") != null);
 }
 
 test "WebChannel relay user_message without access token is rejected" {
